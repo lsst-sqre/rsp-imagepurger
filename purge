@@ -1,0 +1,231 @@
+#!/usr/bin/env sh
+
+# This script will purge images from docker nodes.  This is needed to get
+#  the total number of images on a node down to fewer than 50, which is
+#  the default number displayed by kubelet in response to
+#  'kubectl get node -o yaml'
+
+# The strategy is as follows: our total number of target images is 40 or the
+#  value of the '-t' option.
+#  Our target image is 'registry.hub.docker.com/lsstsqre/sciplat-lab' but is
+#  settable with the '-i' option.
+#
+# We allow up to 10 (or the value of '-o') images on a given node to be
+#  something else (and we will simply throw away the older ones of those;
+#  'crictl images | tac' sorts by image age)
+#
+# For the remaining 30 (or '-n' minus '-o') , up to 3 (or '-d') may be daily
+#  images, up to 3 may be releases, and the rest will be weeklies.  All
+#  images without daily, weekly, or release tags will be purged; these will
+#  be experimental images.  Note that in this script we make no distinction
+#  between real releases and release candidate images, and we always assume
+#  the recommended tag is literally "recommended".  The number of weeklies
+#  retained will always be at least the greater of releases or dailies
+#  retained.
+#
+# At the beginning of the run any untagged images will be removed.
+#
+# If the '-x' option is used, the crictl commands that would have been run
+#  will be displayed, but no actual crictl commands will be run.
+#
+# This script is written in POSIX shell; it uses $() for output capture and
+#  $(()) for shell arithmetic.  When run, it requires access to the 'crictl'
+#  command, which usually implies that it must be run as a user in the
+#  'crictl' group.
+
+usage () {
+    echo 1>&2 "$0 [-h] [-x] [-v]"
+    echo 1>&2 " [-n number-to-retain (40)]"
+    echo 1>&2 " [-i image (registry.hub.docker.com/lsstsqre/sciplat-lab)]"
+    echo 1>&2 " [-o other-retain (10)] [-d daily-retain (3)]"
+    echo 1>&2 " [-r release-retain (3)]"
+}
+
+check_image_count () {
+    # NUMBER_TO_RETAIN must be set before calling.
+    count=$(crictl images | tac | grep -v "REPOSITORY" | wc -l \
+                | sed -e 's/^[ \t]*//')
+    if [ ${count} -lt ${NUMBER_TO_RETAIN} ]; then
+        if [ -n "${VERBOSE}" ]; then
+            echo "${count} images present (<=${NUMBER_TO_RETAIN}); exiting."
+        fi
+        exit 0
+    fi
+}
+
+purge_untagged () {
+    untagged=$(crictl images | grep '<none>' | awk '{print $3}')
+    if [ -n "${untagged}" ]; then
+	crictl rmi ${untagged}
+    fi
+}
+
+# Set defaults
+IMAGE="registry.hub.docker.com/lsstsqre/sciplat-lab"
+NUMBER_TO_RETAIN=40
+OTHER_RETAIN=10
+DAILY_RETAIN=3
+RELEASE_RETAIN=3
+CRICTL="crictl"
+VERBOSE=""
+DRY_RUN=""
+
+# Parse options
+while getopts "hxvn:i:o:d:r:" opt; do
+    case "${opt}" in
+        h)
+            usage
+            exit 0
+            ;;
+        x)
+            CRICTL="echo crictl"
+            DRY_RUN="on"
+            VERBOSE="on"
+            echo "Dry-run mode enabled.  Commands will be shown, but not run."
+            echo "Implies verbose output."
+            ;;
+        v)
+            VERBOSE="on"
+            echo "Maximum verbosity."
+            ;;
+        n)
+            NUMBER_TO_RETAIN=${OPTARG}
+            ;;
+        i)
+            IMAGE=${OPTARG}
+            ;;
+        o)
+            OTHER_RETAIN=${OPTARG}
+            ;;
+        d)
+            DAILY_RETAIN=${OPTARG}
+            ;;
+        r)
+            RELEASE_RETAIN=${OPTARG}
+            ;;
+        *)
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+check_image_count  # Maybe we're starting with enough room.
+purge_untagged
+check_image_count  # Possible that did the trick.
+
+# Get our lists of targets and others.
+imglist=$(crictl images | tac | grep -v REPOSITORY | \
+	      awk '{OFS=":" ; print $1,$2}' | sed -e 's/:<none>//')
+targets=$(echo ${imglist} | tr ' ' '\n' | grep "^${IMAGE}")
+others=$(echo ${imglist} | tr ' ' '\n' | grep -v "^${IMAGE}")
+trashtags=$(echo ${targets} | tr ' ' '\n' | grep -v ":d_" | \
+                grep -v ":r[0-9]" | \
+                grep -v ":w_" | grep -v ":recommended")
+
+if [ -n "${trashtags}" ]; then
+    if [ -n "${VERBOSE}" ]; then
+        echo "Found the following disposably-tagged images: ${trashtags}"
+    fi
+    ${CRICTL} rmi ${trashtags}
+fi
+check_image_count  # And maybe that was enough.
+
+# No?  OK, purge the "others"
+other_count=$(echo ${others} | wc -w | sed -e 's/^[ \t]*//')
+if [ ${other_count} -gt ${OTHER_RETAIN} ]; then
+    purge_count=$((other_count - OTHER_RETAIN))
+    purgelist=$(echo ${others} | tr ' ' '\n' | tail -${purge_count} \
+             | tr '\n' ' ')
+    if [ -n "${purgelist}" ]; then
+        if [ -n "${VERBOSE}" ]; then
+            echo "Removing the following 'other' images: ${purgelist}"
+        fi
+        ${CRICTL} rmi ${purgelist}
+    fi
+fi
+check_image_count  # Maybe _that_ was enough?
+
+# OK, guess we have to be a little more intentional about this.
+imglist=$(crictl images | tac | grep -v REPOSITORY | \
+	      awk '{OFS=":" ; print $1,$2}')
+targets=$(echo ${imglist} | tr ' ' '\n' | grep "${IMAGE}")
+tgt_count=$(echo ${targets} | wc -w | sed -e 's/^[ \t]*//')
+tgt_retain=$(( NUMBER_TO_RETAIN - OTHER_RETAIN ))
+if [ ${tgt_count} -le ${tgt_retain} ]; then
+    echo 1>&2 "We have ${tgt_count} '${IMAGE}' (<=${tgt_retain})"
+    echo 1>&2 "Manually purge some non-'${IMAGE}' images."
+    if [ -n "${DRY_RUN}" ]; then
+        exit 0  # We didn't really purge anything
+    fi
+    exit 2
+fi
+# Put newest ones at top
+dailies=$(echo ${targets} | tr ' ' '\n' | grep ":d_" | sort -r)
+daily_count=$(echo ${dailies} | wc -w | sed -e 's/^[ \t]*//')
+releases=$(echo ${targets} | tr ' ' '\n' | grep ":r_" | sort -r)
+release_count=$(echo ${releases} | wc -w | sed -e 's/^[ \t]*//')
+weeklies=$(echo ${targets} | tr ' ' '\n' | grep ":w_" | sort -r)
+weekly_count=$(echo ${weeklies} | wc -w | sed -e 's/^[ \t]*//')
+d_purge_count=$((daily_count - DAILY_RETAIN))
+if [ ${d_purge_count} -gt 0 ]; then
+    purgelist=$(echo ${dailies} | tr ' ' '\n' | tail -${d_purge_count} \
+             | tr '\n' ' ')
+    if [ -n "${purgelist}" ]; then
+        if [ -n "${VERBOSE}" ]; then
+            echo "Removing the following daily images: ${purgelist}"
+        fi
+        ${CRICTL} rmi ${purgelist}
+    fi
+else
+    d_purge_count=0
+fi
+check_image_count
+r_purge_count=$((release_count - RELEASE_RETAIN))
+if [ "${r_purge_count}" -gt 0 ]; then
+    purgelist=$(echo ${releases} | tr ' ' '\n' | tail -${r_purge_count} \
+             tr '\n' ' ')
+    if [ -n "${purgelist}" ]; then
+        if [ -n "${VERBOSE}" ]; then
+            echo "Removing the following release images: ${purgelist}"
+        fi
+        ${CRICTL} rmi ${purgelist}
+    fi
+else
+    r_purge_count=0
+fi
+check_image_count
+# All other retained images are weeklies
+w_retain=$(( tgt_retain \
+                 - ( (release_count - r_purge_count ) \
+                         + (daily_count - d_purge_count ) ) ))
+# Make sure we have at least as many weeklies as we do of the other
+#  categories.  Weeklies are what people generally use.
+if [ ${w_retain} -lt ${RELEASE_RETAIN} ]; then
+    w_retain=${RELEASE_RETAIN}
+fi
+if [ ${w_retain} -lt ${DAILY_RETAIN} ]; then
+    w_retain=${DAILY_RETAIN}
+fi
+w_purge_count=$(( w_count - w_retain ))
+if [ "${w_purge_count}" -gt 0 ]; then
+    purgelist=$(echo ${weeklies} | tr ' ' '\n' | tail -${w_purge_count} \
+             | tr '\n' ' ')
+    if [ "${purgelist}" ]; then
+        if [ -n "${VERBOSE}" ]; then
+            echo "Removing the following weekly images: ${purgelist}"
+        fi
+        ${CRICTL} rmi ${purgelist}
+    fi
+fi
+check_image_count
+# Uh oh.  We did our purge and we're still here.  Probably this indicates some
+#  images couldn't be deleted because they're in use.  Warn and exit, with
+#  a failure code if we weren't in dry-run mode.
+img_count=$(crictl images | grep -v REPOSITORY | wc -l)
+echo 1>&2 "After purge, ${img_count} images remaining (>${NUMBER_TO_RETAIN})"
+echo 1>&2 "Investigate and remove images manually."
+if [ -n "${DRY_RUN}" ]; then
+    exit 0  # We know we didn't clean anything up.
+fi
+exit 2

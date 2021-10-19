@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: purger
+  namespace: purger
+spec:
+  selector:
+    matchLabels:
+      name: purger
+  template:
+    metadata:
+      labels:
+        name: purger
+    spec:
+      containers:
+      - name: main
+        image: lsstsqre/purger:latest
+        args: [ "tail", "-f", "/dev/null" ]
+        env:
+        - name: CONTAINER_RUNTIME_ENDPOINT
+          value: "unix:///run/containerd/containerd.sock"
+        securityContext:
+          privileged: true
+          runAsUser: 0
+        volumeMounts:
+        - mountPath: /run/containerd/containerd.sock
+          name: runcontainerd
+      volumes:
+      - name: runcontainerd
+        hostPath:
+          path: /run/containerd/containerd.sock
+          type: Socket
+
