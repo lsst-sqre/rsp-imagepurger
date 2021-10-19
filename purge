@@ -30,8 +30,10 @@
 #
 # This script is written in POSIX shell; it uses $() for output capture and
 #  $(()) for shell arithmetic.  When run, it requires access to the 'crictl'
-#  command, which usually implies that it must be run as a user in the
-#  'crictl' group.
+#  command, implies that it must be run as a user with access to the
+#  containerd socket.
+#
+# The example K8s YAML files included simply run with privilege enabled.
 
 usage () {
     echo 1>&2 "$0 [-h] [-x] [-v]"
